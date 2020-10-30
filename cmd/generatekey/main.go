@@ -15,7 +15,7 @@ func main() {
 	flag.Parse()
 
 	// Generate private key.
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {
 		log.Fatal(err)
 	}
