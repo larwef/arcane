@@ -14,9 +14,9 @@ import (
 
 // Header is ...
 type Header struct {
-	SealerPublicKey []byte `json:"sealerPublicKey"`
-	Signature       []byte `json:"signature"`
-	EncryptedKey    []byte `json:"encryptedKey"`
+	SealerCert   []byte `json:"sealerCert"`
+	Signature    []byte `json:"signature"`
+	EncryptedKey []byte `json:"encryptedKey"`
 }
 
 // Message is ...
@@ -27,18 +27,13 @@ type Message struct {
 
 // Sealer is used to encrypt and sign a message.
 type Sealer struct {
-	PrivateKey        *rsa.PrivateKey
-	ReceiverPublicKey *rsa.PublicKey
+	PrivateKey   *rsa.PrivateKey
+	Cert         *x509.Certificate
+	ReceiverCert *x509.Certificate
 }
 
 // Seal encrypts and signs a payload.
 func (s *Sealer) Seal(payload []byte) (*Message, error) {
-	// TODO: Dont want to do this every time. Do it on init.
-	sealerPubKey, err := x509.MarshalPKIXPublicKey(&s.PrivateKey.PublicKey)
-	if err != nil {
-		return nil, err
-	}
-
 	// Make a signature.
 	h := sha256.New()
 	if _, err := h.Write(payload); err != nil {
@@ -75,16 +70,21 @@ func (s *Sealer) Seal(payload []byte) (*Message, error) {
 	encryptedPayload := gcm.Seal(nonce, nonce, payload, nil)
 
 	// Encrypt the encryption key using the receivers public key.
-	encryptedEncryptionKey, err := rsa.EncryptPKCS1v15(rand.Reader, s.ReceiverPublicKey, encryptionKey)
+	receiverPubKey, ok := s.ReceiverCert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, errors.New("receiver public key was not an rsa key")
+	}
+
+	encryptedEncryptionKey, err := rsa.EncryptPKCS1v15(rand.Reader, receiverPubKey, encryptionKey)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Message{
 		Header: Header{
-			SealerPublicKey: sealerPubKey,
-			Signature:       sign,
-			EncryptedKey:    encryptedEncryptionKey,
+			SealerCert:   s.Cert.Raw,
+			Signature:    sign,
+			EncryptedKey: encryptedEncryptionKey,
 		},
 		Payload: encryptedPayload,
 	}, nil
@@ -126,18 +126,18 @@ func (o *Opener) Open(message *Message) ([]byte, error) {
 		return nil, err
 	}
 
-	// Validate signature.
-	pub, err := x509.ParsePKIXPublicKey(message.Header.SealerPublicKey)
+	sealerCert, err := x509.ParseCertificate(message.Header.SealerCert)
 	if err != nil {
 		return nil, err
 	}
 
-	pubKey, ok := pub.(*rsa.PublicKey)
+	// TODO: Validate sender public sertificate.
+
+	// Validate signature.
+	pubKey, ok := sealerCert.PublicKey.(*rsa.PublicKey)
 	if !ok {
 		return nil, errors.New("public key was not an rsa key")
 	}
-
-	// TODO: Validate sender public sertificate.
 
 	h := sha256.New()
 	if _, err := h.Write(plaintext); err != nil {
