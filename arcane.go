@@ -12,6 +12,19 @@ import (
 	"io"
 )
 
+var (
+	// ErrUnableToGetEncryptionKey is returned when Opener is not able to decrypt the encryption key.
+	ErrUnableToGetEncryptionKey = errors.New("unable to get encryption key used to encrypt the message")
+	// ErrUnableToParseSealerCert is returned if Opener is not able to parse the certificate sent by Sealer.
+	ErrUnableToParseSealerCert = errors.New("unable to parse certificate used to seal message")
+	// ErrUntrustedCert is returned if the certificate sent by the sealer is not trusted.
+	ErrUntrustedCert = errors.New("sealer certificate is not trusted")
+	// ErrInvalidSignature is returned if signature is not valid.
+	ErrInvalidSignature = errors.New("invalid signature")
+	// ErrUnableToDecryptPayload is returned if Opener is not able to decrypt payload.
+	ErrUnableToDecryptPayload = errors.New("unable to decrypt payload")
+)
+
 // Header is ...
 type Header struct {
 	SealerCert   []byte `json:"sealerCert"`
@@ -93,19 +106,29 @@ func (s *Sealer) Seal(payload []byte) (*Message, error) {
 // Opener is used to open a encrypted and signed message,
 type Opener struct {
 	PrivateKey *rsa.PrivateKey
+	CertPool   *x509.CertPool
 }
 
 // Open opens a *Message and returns the payload if no errors are encountered.
 func (o *Opener) Open(message *Message) ([]byte, error) {
-	// Get key used to decrypt message.
-	var decryptedKey []byte
-	if err := rsa.DecryptPKCS1v15SessionKey(rand.Reader, o.PrivateKey, message.Header.EncryptedKey, decryptedKey); err != nil {
-		return nil, err
+	// Validate sealer certificate.
+	sealerCert, err := x509.ParseCertificate(message.Header.SealerCert)
+	if err != nil {
+		return nil, ErrUnableToParseSealerCert
 	}
 
-	decryptedKey, err := rsa.DecryptPKCS1v15(rand.Reader, o.PrivateKey, message.Header.EncryptedKey)
+	if _, err := sealerCert.Verify(x509.VerifyOptions{
+		Roots:     o.CertPool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+	}); err != nil {
+		return nil, ErrUntrustedCert
+	}
+
+	// Get key used to encrypt message.
+	var decryptedKey []byte
+	decryptedKey, err = rsa.DecryptPKCS1v15(rand.Reader, o.PrivateKey, message.Header.EncryptedKey)
 	if err != nil {
-		return nil, err
+		return nil, ErrUnableToGetEncryptionKey
 	}
 
 	// Decrypt message.
@@ -123,15 +146,8 @@ func (o *Opener) Open(message *Message) ([]byte, error) {
 	nonce, ciphertext := message.Payload[:nonceSize], message.Payload[nonceSize:]
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, err
+		return nil, ErrUnableToDecryptPayload
 	}
-
-	sealerCert, err := x509.ParseCertificate(message.Header.SealerCert)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: Validate sender public sertificate.
 
 	// Validate signature.
 	pubKey, ok := sealerCert.PublicKey.(*rsa.PublicKey)
@@ -145,7 +161,7 @@ func (o *Opener) Open(message *Message) ([]byte, error) {
 	}
 
 	if err := rsa.VerifyPKCS1v15(pubKey, crypto.SHA256, h.Sum(nil), message.Header.Signature); err != nil {
-		return nil, err
+		return nil, ErrInvalidSignature
 	}
 
 	return plaintext, nil
