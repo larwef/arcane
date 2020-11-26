@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"io"
+	"time"
 )
 
 var (
@@ -23,32 +24,56 @@ var (
 	ErrInvalidSignature = errors.New("invalid signature")
 	// ErrUnableToDecryptPayload is returned if Opener is not able to decrypt payload.
 	ErrUnableToDecryptPayload = errors.New("unable to decrypt payload")
+	// ErrMessageExpired is returned when a message is past its expiration.
+	ErrMessageExpired = errors.New("message is expired")
 )
+
+// Used to simplify testing.
+var now = time.Now
 
 // Header is ...
 type Header struct {
 	SealerCert   []byte `json:"sealerCert"`
 	Signature    []byte `json:"signature"`
 	EncryptedKey []byte `json:"encryptedKey"`
+	Created      string `json:"created"`
+	Expires      string `json:"expires"`
 }
 
-// Message is ...
-type Message struct {
+// Envelope is ...
+type Envelope struct {
 	Header  Header `json:"header"`
 	Payload []byte `json:"payload"`
 }
 
 // Sealer is used to encrypt and sign a message.
 type Sealer struct {
+	TimeToLive   time.Duration
 	PrivateKey   *rsa.PrivateKey
 	Cert         *x509.Certificate
 	ReceiverCert *x509.Certificate
 }
 
 // Seal encrypts and signs a payload.
-func (s *Sealer) Seal(payload []byte) (*Message, error) {
+func (s *Sealer) Seal(payload []byte) (*Envelope, error) {
+	created := now()
+	createdStr := created.Format(time.RFC3339)
+	var expiresStr string
+	if s.TimeToLive != 0 {
+		expiresStr = created.Add(s.TimeToLive).Format(time.RFC3339)
+	} else {
+		// Default to 5min if TTL is not set.
+		expiresStr = created.Add(5 * time.Minute).Format(time.RFC3339)
+	}
+
 	// Make a signature.
 	h := sha256.New()
+	if _, err := h.Write([]byte(createdStr)); err != nil {
+		return nil, err
+	}
+	if _, err := h.Write([]byte(expiresStr)); err != nil {
+		return nil, err
+	}
 	if _, err := h.Write(payload); err != nil {
 		return nil, err
 	}
@@ -93,11 +118,13 @@ func (s *Sealer) Seal(payload []byte) (*Message, error) {
 		return nil, err
 	}
 
-	return &Message{
+	return &Envelope{
 		Header: Header{
 			SealerCert:   s.Cert.Raw,
 			Signature:    sign,
 			EncryptedKey: encryptedEncryptionKey,
+			Created:      createdStr,
+			Expires:      expiresStr,
 		},
 		Payload: encryptedPayload,
 	}, nil
@@ -110,7 +137,16 @@ type Opener struct {
 }
 
 // Open opens a *Message and returns the payload if no errors are encountered.
-func (o *Opener) Open(message *Message) ([]byte, error) {
+func (o *Opener) Open(message *Envelope) ([]byte, error) {
+	expires, err := time.Parse(time.RFC3339, message.Header.Expires)
+	if err != nil {
+		return nil, err
+	}
+
+	if now().After(expires) {
+		return nil, ErrMessageExpired
+	}
+
 	// Validate sealer certificate.
 	sealerCert, err := x509.ParseCertificate(message.Header.SealerCert)
 	if err != nil {
@@ -156,6 +192,12 @@ func (o *Opener) Open(message *Message) ([]byte, error) {
 	}
 
 	h := sha256.New()
+	if _, err := h.Write([]byte(message.Header.Created)); err != nil {
+		return nil, err
+	}
+	if _, err := h.Write([]byte(message.Header.Expires)); err != nil {
+		return nil, err
+	}
 	if _, err := h.Write(plaintext); err != nil {
 		return nil, err
 	}
